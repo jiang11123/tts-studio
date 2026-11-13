@@ -11,7 +11,7 @@ import sys
 import zipfile
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = (Path(__file__).resolve().parent.parent / "VERSION").read_text(encoding="utf-8").strip()  # 版本号只在根目录 VERSION 里改
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 DIST = ROOT / "dist"
@@ -19,7 +19,7 @@ STAGE = DIST / "stage"
 CSC = Path(os.environ.get("SystemRoot", r"C:\Windows")) / r"Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 ICON = ROOT / "launcher" / "tts-studio.ico"
 
-APP_FILES = ["app.py", "engines.py", "api_server.py", "mcp_server.py", "speed.py", "splitter.py", "desktop.py",
+APP_FILES = ["app.py", "engines.py", "updater.py", "api_server.py", "mcp_server.py", "speed.py", "splitter.py", "desktop.py",
              "requirements.txt", "README.md", "LICENSE", "NOTICE"]
 APP_DIRS = ["third_party"]
 SKIP = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")

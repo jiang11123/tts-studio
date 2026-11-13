@@ -19,6 +19,7 @@ import soundfile as sf
 
 import api_server
 import mcp_server
+import updater
 import engines as E
 from speed import change_pitch, change_speed, change_volume
 from splitter import group_sentences, split_sentences
@@ -563,6 +564,55 @@ def vc_save(name, cand, ref, ref_text, engine):
     return gr.update(choices=lib_choices(), value=name), msg, lib_list(), ""
 
 
+
+# ───────────────────────── 自动更新（侧栏底部） ─────────────────────────
+def upd_view(info=None, msg=""):
+    """侧栏底部：平时只显示版本号；有新版本时变成一张小卡片 + 更新按钮。"""
+    cur = updater.current()
+    if not info:
+        return (f"<div class='upd'><span class='upd-ver'>v{cur}</span>{html.escape(msg)}</div>",
+                gr.update(visible=False))
+    first = next((ln.strip("# ").strip() for ln in info["notes"].splitlines() if ln.strip()), "")
+    card = (f"<div class='upd new'><b>发现新版本 v{html.escape(info['version'])}</b>"
+            f"<span>当前 v{cur}{'：' + html.escape(first[:40]) if first else ''}</span>"
+            f"<a href='{html.escape(info['page'])}' target='_blank'>看更新内容</a>"
+            + (f"<em>{html.escape(msg)}</em>" if msg else "") + "</div>")
+    if not updater.installed():
+        return card + "<div class='upd-tip'>源码运行：git pull 或去下载页装新版</div>", gr.update(visible=False)
+    return card, gr.update(visible=True, value=f"更新到 v{info['version']}", interactive=True)
+
+
+def upd_check():
+    return upd_view(updater.check())
+
+
+def upd_go():
+    import threading
+    info = updater.check()
+    if not info:
+        yield upd_view(None, " · 已是最新")
+        return
+    err = []
+    t = threading.Thread(target=_upd_apply, args=(info, err), daemon=True)
+    t.start()
+    while t.is_alive():
+        yield upd_view(info, updater.progress())[0], gr.update(interactive=False, value="更新中…")
+        time.sleep(0.5)
+    if err:
+        yield upd_view(info, "更新失败：" + err[0])
+    else:
+        yield upd_view(info, updater.progress())[0], gr.update(interactive=False, value="正在重启…")
+
+
+def _upd_apply(info, err):
+    try:
+        updater.apply(info)
+        return True
+    except Exception as e:
+        err.append(str(e) or type(e).__name__)
+        return False
+
+
 # ───────────────────────── 项目（整稿分句） ─────────────────────────
 def proj_path(name: str) -> Path:
     safe = "".join(ch for ch in (name or "").strip() if ch not in '\\/:*?"<>|') or "未命名"
@@ -851,6 +901,15 @@ footer { display: none !important; }
 #nw-side button.nav.on { background: #f3f4f7 !important; font-weight: 700 !important; }
 #nw-side .nav-group { font-size: 13px; color: var(--nw-sub); padding: 18px 12px 6px; }
 #nw-side .nav-gap { flex: 1; min-height: 18px; }
+.upd { font-size: 12px; color: var(--nw-sub); padding: 6px 10px 0; display: flex; flex-direction: column; gap: 2px; }
+.upd-ver { color: #b0b0ba; }
+.upd.new { background: #f3f0ff; border-radius: 12px; padding: 10px 12px; margin: 8px 6px 0; color: #5a5a68; }
+.upd.new b { color: var(--nw-accent); font-size: 13px; }
+.upd.new a { color: var(--nw-accent); text-decoration: underline; width: fit-content; }
+.upd.new em { font-style: normal; color: #5a5a68; margin-top: 4px; }
+.upd-tip { font-size: 11px; color: var(--nw-sub); padding: 4px 16px 0; }
+button.upd-btn { margin: 6px 6px 0 !important; background: var(--nw-accent) !important; color: #fff !important; border: none !important;
+  border-radius: 999px !important; height: 34px; font-size: 13px !important; font-weight: 700 !important; box-shadow: none !important; }
 #nw-side .nw-foot { margin-top: auto; font-size: 12px; color: var(--nw-sub); line-height: 1.7; padding: 0 10px; }
 
 /* 主区 */
@@ -1712,6 +1771,8 @@ with gr.Blocks(title="TTS Studio") as demo:
                 nav_btns.append(gr.Button(label, elem_id=f"nav-{pid}", elem_classes=["nav", "on"] if pid == "home" else ["nav"]))
             gr.HTML("<div class='nw-foot'>Breeze 可加 [笑] [叹气] [咳嗽]<br>显存不够时先关掉其他占显卡的软件<br>"
                     "克隆别人的声音前请先取得本人同意</div>")
+            upd_html = gr.HTML(upd_view()[0])
+            upd_btn = gr.Button("更新", visible=False, elem_classes="upd-btn")
 
         # ── 主区 ──
         with gr.Column(elem_id="nw-main", scale=1):
@@ -2235,6 +2296,9 @@ with gr.Blocks(title="TTS Studio") as demo:
     PROJ_OUT = [proj_name, script, sents, voice_dd, tone_dd, tone_text, b_cfg, status]
     proj_name.input(proj_switch, [proj_name], PROJ_OUT).then(tts_history, [proj_name], [hist_html])
     demo.load(auto_load, None, PROJ_OUT).then(tts_history, [proj_name], [hist_html])
+    # 查更新要联网，别占着队列（默认一次只跑一个事件）
+    demo.load(upd_check, None, [upd_html, upd_btn], show_progress="hidden", concurrency_limit=None)
+    upd_btn.click(upd_go, None, [upd_html, upd_btn], show_progress="hidden", concurrency_limit=None)
 
     API_IN = [mm_key, mm_base, mm_model, vc_appid, vc_token, vc_cluster, oa_base, oa_key, oa_model]
     b_api.click(save_api, API_IN, set_info, concurrency_limit=None)

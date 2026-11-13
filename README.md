@@ -34,6 +34,10 @@
 
 **Windows 安装包（推荐，不用自己装 Python）**：下载 `TTS-Studio-Setup-x.y.z.exe`（约 35 MB），双击安装，不需要管理员权限，默认装在 `%LOCALAPPDATA%\Programs\TTS Studio`。第一次打开会弹一个进度窗口，自动从国内镜像联网安装 PyTorch 等运行环境（有 N 卡装显卡版约 3 GB，没有装 CPU 版），十几分钟，只需要一次。卸载：「设置 → 应用」里找 TTS Studio，可以选保留音色和模型。
 
+**自动更新**：软件每次打开会查一下 GitHub 上有没有新版本，有的话左下角提示「发现新版本」，点「更新」会自动下载、关闭、安装并重新打开，音色、项目、模型都保留。
+
+发新版本（维护者）：`python packaging/release.py 0.1.2 "这次改了什么"`，会改版本号、打包、推送代码、建 Release 并上传安装包；只推代码不发版本用 `python packaging/release.py --push-only "说明"`。
+
 自己打安装包：装好 uv 和 `uv python install 3.11`，然后运行 `python packaging/build.py`，输出在 `dist/`。静默安装：`TTS-Studio-Setup-x.y.z.exe /S [/D=目录] [/NOSHORTCUTS] [/NOREG]`。
 
 **从源码运行**：需要 Python 3.10～3.12（推荐 3.11）。
