@@ -1,0 +1,18 @@
+TTS Studio
+本项目代码以 Apache License 2.0 发布（见 LICENSE）。
+
+第三方代码
+----------
+third_party/breeze/ 来自 BreezeBlue 的 breeze-tts 推理代码
+  https://github.com/breezeblue-ai/breeze-tts （commit daa6cb2efe5471f09369229f322d20bb956cb3c3）
+  许可证：Apache License 2.0（见 third_party/breeze/LICENSE）
+  改动：删除了 breeze_infer/api.py（HTTP 服务，本项目不需要），其余文件未修改。
+
+模型（不随本仓库分发，用户在软件里自行下载）
+------------------------------------------
+Qwen3-TTS（Qwen/Qwen3-TTS-12Hz-*）       Apache License 2.0，可商用
+Breeze TTS 2（BreezeBlue/Breeze-TTS-2）  BreezeBlue Research and Non-Commercial License
+  模型权重以及用它生成的音频仅限研究和非商业用途：
+  https://huggingface.co/BreezeBlue/Breeze-TTS-2/blob/main/LICENSE
+
+配音 API（MiniMax、火山引擎 / 豆包、OpenAI 兼容接口）按各服务商自己的条款使用，费用由使用者自己的账号承担。

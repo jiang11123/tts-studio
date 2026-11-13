@@ -1,0 +1,12 @@
+# torch / torchaudio 由 install 脚本按显卡单独安装（CUDA 版），这里不写
+gradio==6.17.3
+transformers==4.57.3
+accelerate==1.12.0
+qwen-tts==0.1.1
+numpy>=2.0
+soundfile>=0.13
+soxr>=0.5
+requests>=2.31
+imageio-ffmpeg>=0.5
+pywebview>=6.0; sys_platform == "win32"
+mcp>=1.10

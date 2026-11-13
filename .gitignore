@@ -1,0 +1,15 @@
+# 用户自己的数据：设置（含 API Key）、音色、项目、生成的音频、下载的模型
+data/
+
+# 环境
+.venv/
+__pycache__/
+*.py[cod]
+.idea/
+.vscode/
+
+# 打包输出
+dist/
+
+# 本机的页面文件备份
+pagefile-backup-*.txt
