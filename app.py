@@ -17,6 +17,17 @@ import gradio as gr
 import numpy as np
 import soundfile as sf
 
+import faulthandler
+
+# 进程被段错误/访问冲突直接打死时 Python 来不及抛异常，app.err.log 里什么都没有；
+# faulthandler 会把每个线程当时的调用栈追加写进 crash.log（app.log 每次启动会被清空，这个不清）
+_crash_dir = Path(__file__).resolve().parent / "data" / "logs"
+_crash_dir.mkdir(parents=True, exist_ok=True)
+_crash_log = open(_crash_dir / "crash.log", "a", encoding="utf-8")
+_crash_log.write(f"\n===== 启动 {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+_crash_log.flush()
+faulthandler.enable(file=_crash_log, all_threads=True)
+
 import api_server
 import mcp_server
 import updater
@@ -33,7 +44,6 @@ for d in (OUT_DIR, VOICE_DIR, PROJ_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 SR = E.OUT_SR
-E.preload()
 
 # ───────────────────────── 语气库 ─────────────────────────
 # 语气和音色分开：音色 = 谁在说（参考音频），语气 = 怎么说（一句提示词）。
@@ -624,6 +634,16 @@ def proj_path(name: str) -> Path:
 LAST_PROJ = PROJ_DIR / "_last.txt"
 
 
+def _last_voice() -> dict | None:
+    """上次打开的项目用的音色（给启动预加载用）；读不到就返回 None。"""
+    try:
+        name = LAST_PROJ.read_text(encoding="utf-8").strip()
+        v = json.loads((PROJ_DIR / name / "project.json").read_text(encoding="utf-8")).get("voice")
+        return lib_read(v) if v and v in lib_list() else None
+    except Exception:
+        return None
+
+
 def save_project(name, script, items, settings=None):
     """settings：这个项目用的音色/语气 {voice, tone, tone_text, cfg}；不传就沿用项目里原来记的。"""
     f = proj_path(name) / "project.json"
@@ -727,15 +747,23 @@ def set_item_voice(i, v, items, name, script):
     return items, f"第 {i + 1} 句改成{who}：点那一行的「重新生成」，或点底部「生成全部」（只会补这类改过的句子）。"
 
 
-def gen_missing(items, name, script, voice, tone_name, cfg, tone, seed, lang="", progress=gr.Progress()):
+def gen_missing(items, name, script, voice, tone_name, cfg, tone, seed, lang="", progress=gr.Progress(), force=False):
+    """force=True：「全部重新生成」，每句有字的都重读一遍，不管有没有音频。"""
     if not items:
         raise gr.Error("先点「拆句」")
-    if voice not in lib_list() and any(_needs_gen(it) and not _item_voice(it) for it in items):
+    need = (lambda it: bool(it["text"])) if force else _needs_gen
+    if voice not in lib_list() and any(need(it) and not _item_voice(it) for it in items):
         raise gr.Error("先在「音色」下拉框里选一个音色")
     # 记住这个项目用的音色和语气，下次载入自动选上
     save_project(name, script, items,
                  {"voice": voice, "tone": tone_name, "tone_text": (tone or "").strip(), "cfg": float(cfg)})
-    todo = [i for i, it in enumerate(items) if _needs_gen(it)]  # 刚插入还没填字的空句跳过
+    todo = [i for i, it in enumerate(items) if need(it)]  # 刚插入还没填字的空句跳过
+    if force:
+        # 文字、音色、种子都不变时读出来几乎一样，所以这类句子换个种子 = 换一种读法（跟单句「重新生成」一致）
+        for i in todo:
+            it = items[i]
+            if it.get("audio") and it["text"] == it.get("gen_text") and _item_voice(it) == it.get("gen_voice"):
+                it["seed"] = int(it["seed"]) + 1
     if not todo:
         yield items, "所有句子都已生成，没有需要补的。", gr.skip()
         return
@@ -761,9 +789,15 @@ def regen_one(i, text, items, name, script, voice, cfg, tone, _seed, lang, bump)
     if bump or (it["text"] == it.get("gen_text") and _item_voice(it) == it.get("gen_voice")):
         it["seed"] = int(it["seed"]) + 1
     t0 = time.time()
-    _gen_item(it, name, i, voice, cfg, tone, lang)
+    try:
+        _gen_item(it, name, i, voice, cfg, tone, lang)
+    except Exception as e:
+        # 列表必须重绘一次，行上的「生成中」转圈才会消失；返回新列表对象保证触发重绘
+        gr.Warning(f"第 {i + 1} 句没生成成功：{e}")
+        # 带上时间，连续失败两次文字也不一样，前端才能认出「又结束了一次」
+        return [dict(x) for x in items], f"第 {i + 1} 句没生成成功（{time.strftime('%H:%M:%S')}）：{e}"
     save_project(name, script, items)
-    return items, f"第 {i + 1} 句已重新生成（种子 {it['seed']}），用时 {time.time() - t0:.0f} 秒。"
+    return [dict(x) for x in items], f"第 {i + 1} 句已重新生成（种子 {it['seed']}），用时 {time.time() - t0:.0f} 秒。"
 
 
 def edit_text(i, text, items, name, script):
@@ -999,6 +1033,15 @@ button.mini.del:hover { color: #e5484d !important; border-color: #ffd2d2 !import
   background: #fff; align-items: center !important; }
 .sent-row:hover { border-color: #ddd6ff; }
 .sent-no { font-weight: 800; color: var(--nw-text); font-size: 15px; }
+.sent-row.busy { border-color: #8b5cf6 !important; box-shadow: 0 0 0 3px #ede9fe; }
+@keyframes nw-spin { to { transform: rotate(360deg); } }
+.sent-row.busy .sent-st { font-size: 0; background: #f3efff; display: inline-flex; align-items: center; gap: 4px; }
+.sent-row.busy .sent-st::before, button.busy::before { content: ""; width: 11px; height: 11px; border: 2px solid #d9cdfe;
+  border-top-color: #7c3aed; border-radius: 50%; display: inline-block; animation: nw-spin .8s linear infinite; flex: none; }
+.sent-row.busy .sent-st::after { content: "生成中"; font-size: 12px; color: #7c3aed; }
+button.busy { pointer-events: none; font-size: 0 !important; display: inline-flex !important; align-items: center;
+  justify-content: center; gap: 6px; border-color: #c4b5fd !important; }
+button.busy::after { content: "生成中"; font-size: 13px; color: #7c3aed; }
 .sent-st { display: inline-block; white-space: nowrap; font-size: 12px; border-radius: 6px; padding: 1px 6px; margin-top: 4px; font-weight: 600; }
 .st-todo { background: #f2f2f5; color: #8a8a99; } .st-ok { background: #e8f7ee; color: #1f9a55; }
 .st-old { background: #fff4e0; color: #c27a00; }
@@ -1063,6 +1106,32 @@ NAV_ICON = {  # 线条图标（24×24，stroke），用 CSS mask 着色，跟文
     "set": "<circle cx='12' cy='12' r='3'/><path d='M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1"
            "M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1'/>",
 }
+
+
+# 句子列表「重新生成」：点下去立刻在那一行转圈（不等后端回话），列表重绘后整行重建，转圈自然消失
+HEAD_JS = """<script>
+// 只加/去 class，样式全在 CSS 里；不改 Gradio 自己管的 DOM（行是按 key 复用的，改了不会被还原）
+window.nwBusyRow = function (i) {
+  const row = document.getElementById('sent-row-' + i);
+  const btn = document.getElementById('re-btn-' + i);
+  if (row) row.classList.add('busy');
+  if (btn) btn.classList.add('busy');
+};
+window.nwClearBusy = function (i) {
+  // 只清这一句：连点几句时，排队的那几句要一直转到轮到它们做完
+  ['sent-row-' + i, 're-btn-' + i].forEach(id => { const e = document.getElementById(id); if (e) e.classList.remove('busy'); });
+};
+// 连点几句时，前一句做完列表会重绘，后面排队那句的 .then 回调会丢；所以再盯着状态栏：
+// 出现「第 N 句已重新生成 / 没生成成功」就清掉第 N 句的转圈
+(function watchStatus() {
+  const box = document.querySelector('.tts-status');
+  if (!box) return setTimeout(watchStatus, 500);
+  new MutationObserver(() => {
+    const m = (box.innerText || '').match(/第 (\d+) 句(已重新生成|没生成成功)/);
+    if (m) window.nwClearBusy(parseInt(m[1], 10) - 1);
+  }).observe(box, { childList: true, subtree: true, characterData: true });
+})();
+</script>"""
 
 
 def _nav_css():
@@ -1240,7 +1309,7 @@ def save_paths(model_dir, preload):
         raise gr.Error("有模型正在下载，下完（或暂停）再改文件夹")
     s = E.settings_load()
     s["model_dir"] = (model_dir or "").strip() or E.DEFAULT_SETTINGS["model_dir"]
-    s["preload"] = "breeze" if preload else ""
+    s["preload"] = "auto" if preload else ""
     E.settings_save(s)
     return f"已保存。模型下载到：{s['model_dir']}"
 
@@ -1561,7 +1630,7 @@ def tts_upload(f):
 
 
 def tts_generate(script, name, seed, per, items, longmode, voice, tone_name, cfg, tone, lang,
-                 gap, speed, pitch, vol, progress=gr.Progress()):
+                 gap, speed, pitch, vol, progress=gr.Progress(), force=False):
     """「生成音频」：拆句（长文模式下已有句子就不重拆）→ 只生成没生成/改过的句子 → 合并成一条。"""
     if not (script or "").strip() and not items:
         raise gr.Error("先在上面输入文字")
@@ -1571,7 +1640,7 @@ def tts_generate(script, name, seed, per, items, longmode, voice, tone_name, cfg
         items, msg = do_split(script, name, seed, per, items)
         yield items, msg, gr.skip(), gr.skip(), gr.skip()
     last_audio = None
-    for items, msg, au in gen_missing(items, name, script, voice, tone_name, cfg, tone, seed, lang, progress):
+    for items, msg, au in gen_missing(items, name, script, voice, tone_name, cfg, tone, seed, lang, progress, force):
         last_audio = au if au is not gr.skip() else last_audio
         yield items, msg, au, gr.skip(), gr.skip()
     if longmode:  # 拆句模式：只出逐句的音频，满意了再点「合并成完整音频」
@@ -1581,6 +1650,13 @@ def tts_generate(script, name, seed, per, items, longmode, voice, tone_name, cfg
         return
     out, mmsg = merge_all(items, gap, speed, name, pitch, vol)
     yield items, mmsg, gr.skip(), out, tts_history(name)
+
+
+def tts_regen_all(script, name, seed, per, items, longmode, voice, tone_name, cfg, tone, lang,
+                  gap, speed, pitch, vol, progress=gr.Progress()):
+    """「全部重新生成」：跟「生成音频」一样的流程，但每句都重读（旧音频文件留在项目文件夹里，不删）。"""
+    yield from tts_generate(script, name, seed, per, items, longmode, voice, tone_name, cfg, tone, lang,
+                            gap, speed, pitch, vol, progress, force=True)
 
 
 def tts_remerge(items, gap, speed, name, pitch, vol):
@@ -1818,7 +1894,14 @@ with gr.Blocks(title="TTS Studio") as demo:
                                                              scale=0, min_width=38)
                                     gr.HTML("", elem_classes="tts-fill", scale=1, min_width=10)
                                     split_tag = gr.Button("拆句", elem_classes="tts-split", scale=0, min_width=96)
+                                    regen_btn = gr.Button("↻ 全部重新生成", elem_classes="tts-split", scale=0, min_width=140)
                                     gen_btn = gr.Button("✦ 生成音频", elem_classes="tts-go", scale=0, min_width=170)
+                            with gr.Column(visible=False) as regen_confirm:  # 页面内二次确认，免得误点把整篇重读
+                                gr.Markdown("确定全部重新生成吗？每一句都会重读一遍（没改字的句子会换一种读法），"
+                                            "句子多的话要等一阵。旧音频文件不删，还在项目文件夹里。")
+                                with gr.Row():
+                                    regen_yes = gr.Button("确认全部重新生成", variant="stop", size="sm")
+                                    regen_no = gr.Button("取消", size="sm")
                             lang_tip = gr.HTML("", elem_classes="tts-tipbox")
                             status = gr.Markdown(elem_classes="tts-status")
                             with gr.Column(elem_classes="tts-result") as result_box:
@@ -1836,7 +1919,7 @@ with gr.Blocks(title="TTS Studio") as demo:
                                                 type="filepath")
                                 sents = gr.State([])
 
-                                @gr.render(inputs=[sents])
+                                @gr.render(inputs=[sents], concurrency_limit=1)
                                 def show_rows(items):
                                     if not items:
                                         gr.HTML("<div class='list-hint'>在上面输入文字，点「生成音频」或「重新拆句」，这里会一句一行列出来。</div>")
@@ -1860,7 +1943,7 @@ with gr.Blocks(title="TTS Studio") as demo:
                                             st = "<span class='sent-st st-old'>音色改了</span>"
                                         else:
                                             st = "<span class='sent-st st-ok'>已生成</span>"
-                                        with gr.Row(equal_height=True, key=f"row{i}", elem_classes="sent-row"):
+                                        with gr.Row(equal_height=True, key=f"row{i}", elem_classes="sent-row", elem_id=f"sent-row-{i}"):
                                             gr.HTML(f"<div class='sent-no'>{i + 1}</div>{st}", min_width=62, scale=0, key=f"no{i}")
                                             tb = gr.Textbox(
                                                 value=it["text"], lines=2, show_label=False, scale=5, key=f"tb{i}",
@@ -1878,7 +1961,7 @@ with gr.Blocks(title="TTS Studio") as demo:
                                                     container=False, key=f"vo{i}", interactive=True, preserved_by_key=None,
                                                     elem_classes=["pill", "sent-voice"] + (["own"] if iv else []),
                                                 )
-                                                b_re = gr.Button("重新生成", size="sm", key=f"re{i}", elem_classes="ghost")
+                                                b_re = gr.Button("重新生成", size="sm", key=f"re{i}", elem_classes="ghost", elem_id=f"re-btn-{i}")
                                                 with gr.Row(key=f"opr{i}"):
                                                     b_ins = gr.Button("＋ 插句", size="sm", key=f"ins{i}", elem_classes="mini",
                                                                       min_width=40)
@@ -1896,7 +1979,9 @@ with gr.Blocks(title="TTS Studio") as demo:
                                         b_re.click(
                                             lambda t, items, name, scr, *v, i=i: regen_one(i, t, items, name, scr, *v, False),
                                             [tb, sents, proj_name, script, *VOICE, b_seed, lang_dd], [sents, status],
-                                        )
+                                            js=f"(...a) => {{ window.nwBusyRow && window.nwBusyRow({i}); return a; }}",
+                                            show_progress="hidden",
+                                        ).then(None, None, None, js=f"() => {{ window.nwClearBusy && window.nwClearBusy({i}); }}")
                                         b_ins.click(
                                             lambda items, name, scr, sd, i=i: insert_one(i + 1, items, name, scr, sd),
                                             [sents, proj_name, script, b_seed], [sents, status],
@@ -2126,7 +2211,8 @@ with gr.Blocks(title="TTS Studio") as demo:
                                 "名字和魔搭上一样（比如 Breeze-TTS-2），就算装好了，不用重新下。</div>")
                         with gr.Row(elem_classes="toolbar"):
                             set_model_dir = gr.Textbox(_s0["model_dir"], label="模型下载到哪个文件夹", scale=3)
-                            set_preload = gr.Checkbox(_s0.get("preload") == "breeze", label="启动时预加载 Breeze", scale=1)
+                            set_preload = gr.Checkbox(_s0.get("preload") in ("auto", "breeze"), label="启动时预加载模型（跟上次项目的音色）",
+                                                      scale=1)
                             b_paths = gr.Button("保存", elem_classes="ghost", size="sm", scale=0, min_width=90)
 
                     gr.HTML("<div class='nw-sec'>接入第三方配音 API</div>")
@@ -2258,6 +2344,13 @@ with gr.Blocks(title="TTS Studio") as demo:
                                  tone_text, lang_dd, gap, speed, pitch, vol],
                   [sents, status, live, full_audio, hist_html]).then(
         lambda n: gr.update(choices=projects_list(), value=n), [proj_name], [proj_name])
+    regen_btn.click(lambda: gr.update(visible=True), None, regen_confirm)
+    regen_no.click(lambda: (gr.update(visible=False), "已取消，没有重新生成。"), None, [regen_confirm, status])
+    regen_yes.click(lambda: gr.update(visible=False), None, regen_confirm).then(
+        tts_regen_all, [script, proj_name, b_seed, per_group, sents, longmode, voice_dd, tone_dd, b_cfg,
+                        tone_text, lang_dd, gap, speed, pitch, vol],
+        [sents, status, live, full_audio, hist_html]).then(
+        lambda n: gr.update(choices=projects_list(), value=n), [proj_name], [proj_name])
     merge_btn.click(tts_remerge, [sents, gap, speed, proj_name, pitch, vol], [full_audio, status, hist_html]).then(
         lambda: gr.Column(visible=True), None, [result_box], show_progress="hidden")
     # MiniMax 式编辑框：字数、清空、上传、插入停顿 / 语气词、长文模式、语言、模型筛音色
@@ -2359,10 +2452,11 @@ if __name__ == "__main__":
             return PlainTextResponse("not found", status_code=404)
         return FileResponse(f, media_type="audio/wav")
     demo.queue(max_size=8, default_concurrency_limit=1)
+    E.preload(_last_voice())  # 开了预加载：跟上次项目的音色，在后台把模型先装好
     # 开了局域网访问：网页也要登录（用户名随便填，密码 = 接口 Key），免得同一个网里的人随便用
     auth = (lambda u, pw: secrets.compare_digest(pw.encode(), api_server.server_conf()["api_key"].encode())) \
         if _srv["lan"] else None
-    fapp = gr.mount_gradio_app(fapp, demo, path="/", allowed_paths=[str(DATA)], theme=THEME, css=CSS, auth=auth,
+    fapp = gr.mount_gradio_app(fapp, demo, path="/", allowed_paths=[str(DATA)], theme=THEME, css=CSS, head=HEAD_JS, auth=auth,
                                auth_message="用户名随便填，密码是「开放接口」页里的接口 Key")
     print(f"网页：http://127.0.0.1:{PORT}    接口：{api_base()}    接口文档：http://127.0.0.1:{PORT}/v1/docs",
           flush=True)

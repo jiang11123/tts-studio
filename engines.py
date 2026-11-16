@@ -353,8 +353,10 @@ def _require_headroom(need_commit: float, need_vram: float, what: str) -> None:
             "两个办法：1) 关掉 Chrome 多余标签页、Claude、QQ、WPS 这些程序，腾出提交额度，马上就能再试；\n"
             "2) 永久解决：系统属性 → 高级 → 性能设置 → 高级 → 虚拟内存，把页面文件调到固定 32768 MB，重启一次。"
         )
+    # 显存只拦明显装不下的情况（空闲不到所需的六成）。差一点点时照旧先加载 ——
+    # 旧版不检查，空闲 6.6 GB 也能正常装下 Breeze；真装不下由 load 里的 OOM 兜底报错。
     v = _vram_gb()
-    if v is not None and v[0] < need_vram:
+    if v is not None and v[0] < need_vram * 0.6:
         raise RuntimeError(
             f"显存不够，装不下 {what}：现在空闲 {v[0]:.1f} GB（共 {v[1]:.1f} GB），大约需要 {need_vram:.1f} GB。\n"
             "把浏览器/剪辑软件关掉腾出显存，或者在「设置 → 显卡」里先点一下释放。"
@@ -367,6 +369,106 @@ def _breeze_path():
     p = str(ROOT / "third_party" / "breeze")
     if p not in sys.path:
         sys.path.insert(0, p)
+
+
+_ST_DTYPES = {"BF16": "bfloat16", "F16": "float16", "F32": "float32", "F64": "float64", "I64": "int64",
+              "I32": "int32", "I16": "int16", "I8": "int8", "U8": "uint8", "BOOL": "bool"}
+
+
+def _stream_state_dict(ckpt_dir: Path, device: str, dtype) -> dict:
+    """不用 mmap，逐个张量读 safetensors 直接送显卡：额外提交内存只占当前这一个张量。"""
+    import torch
+    sd = {}
+    for f in sorted(Path(ckpt_dir).glob("*.safetensors")):
+        with open(f, "rb") as fh:
+            n = int.from_bytes(fh.read(8), "little")
+            hdr = json.loads(fh.read(n))
+            base = 8 + n
+            items = sorted(((k, v) for k, v in hdr.items() if k != "__metadata__"),
+                           key=lambda kv: kv[1]["data_offsets"][0])
+            for name, info in items:
+                s, e = info["data_offsets"]
+                dt = getattr(torch, _ST_DTYPES[info["dtype"]])
+                if e == s:
+                    t = torch.empty(info["shape"], dtype=dt)
+                else:
+                    fh.seek(base + s)
+                    buf = bytearray(e - s)
+                    fh.readinto(buf)
+                    t = torch.frombuffer(buf, dtype=dt).reshape(info["shape"])
+                if t.is_floating_point():
+                    t = t.to(dtype)
+                sd[name] = t.to(device)
+                del t
+    return sd
+
+
+def _load_breeze_streaming(ckpt_dir: Path, device: str):
+    """等同 breeze_infer.runtime.load_runtime（显卡版），只是主模型权重不走 mmap。"""
+    import torch
+    from transformers import AutoTokenizer, GenerationConfig
+    from models.breeze import BreezeForConditionalGeneration
+    from qwen_tts import Qwen3TTSTokenizer
+    torch.cuda.set_device(device)
+    tok = AutoTokenizer.from_pretrained(ckpt_dir, fix_mistral_regex=False)
+    cfg = BreezeForConditionalGeneration.config_class.from_pretrained(ckpt_dir)
+    gen_cfg = GenerationConfig.from_pretrained(ckpt_dir)
+    sd = _stream_state_dict(ckpt_dir, device, torch.bfloat16)
+    # state_dict 已经在显卡上，transformers 直接拿来当参数，不会再复制一份
+    model = BreezeForConditionalGeneration.from_pretrained(
+        None, config=cfg, state_dict=sd, generation_config=gen_cfg, dtype=torch.bfloat16,
+        attn_implementation="eager", device_map=device)
+    del sd
+    model.eval()
+    atok_dir = ckpt_dir / "audio_tokenizer"
+    if not atok_dir.is_dir():
+        raise FileNotFoundError(f"Breeze 模型包里缺 audio_tokenizer：{atok_dir}")
+    atok = Qwen3TTSTokenizer.from_pretrained(str(atok_dir), device_map=device)
+    return tok, model, atok
+
+
+def _make_cpu_embedding_cls():
+    import torch
+
+    class _CpuEmbedding(torch.nn.Module):
+        """词表放内存：查表在 CPU 上做，结果同步拷回原来的显卡（不用 non_blocking、不用 hook）。"""
+
+        def __init__(self, emb):
+            super().__init__()
+            self.dev = emb.weight.device
+            self.num_embeddings, self.embedding_dim = emb.num_embeddings, emb.embedding_dim
+            self.padding_idx = emb.padding_idx
+            self.weight = torch.nn.Parameter(emb.weight.detach().to("cpu").clone(), requires_grad=False)
+
+        def forward(self, input_ids):
+            out = torch.nn.functional.embedding(input_ids.detach().to("cpu"), self.weight, self.padding_idx)
+            return out.to(self.dev)
+
+    return _CpuEmbedding
+
+
+def _CpuEmbedding(emb):
+    global _CPU_EMB_CLS
+    try:
+        cls = _CPU_EMB_CLS
+    except NameError:
+        cls = _CPU_EMB_CLS = _make_cpu_embedding_cls()
+    return cls(emb)
+
+
+def _embed_to_cpu(model) -> None:
+    """把 1 GB 的文字词表 embed_text_tokens 放回内存，省出 1 GB 显存。
+
+    11-14 实测（4060 8G）：模型 7 GB + 桌面/资源管理器占的 0.85 GB 把显存塞满，
+    多出的 0.9 GB 被驱动挪到「共享显存」（走 PCIe 读内存），一句话要生成好几分钟。
+    这张表只在每句开头查一次（不在逐帧的 CUDA Graph 里），放 CPU 上查完再搬回显卡，几乎不费时间。
+    文本编码器自己的词表在它的 CUDA Graph 里用，不能动。"""
+    import torch
+    emb = getattr(model, "embed_text_tokens", None)
+    if not isinstance(emb, torch.nn.Embedding) or emb.weight.device.type != "cuda":
+        return
+    model.embed_text_tokens = _CpuEmbedding(emb)
+    _free_gpu()
 
 
 class BreezeEngine(Engine):
@@ -392,8 +494,11 @@ class BreezeEngine(Engine):
         _atok = _d / "audio_tokenizer" / "model.safetensors"  # glob 不含子目录，单独算
         if _atok.is_file():
             _size += _atok.stat().st_size / 1024 ** 3
-        # 有显卡时权重是从文件映射直接搬进显存，不会一次占满 _size 的提交额度（旧版不检查也能正常加载）；
-        # 而且页面文件是「系统管理大小」时提交上限会自己涨。所以只拦住真的快见底的情况，只有纯 CPU 才按全量算。
+        # 11-13 实测（4060 8G）：官方 load_runtime 用 safetensors 的 mmap（写时复制映射），
+        # Windows 会把整个 5 GB 分片一次性记进提交额度，「系统管理大小」的页面文件来不及长大，
+        # 进程直接段错误 / 被杀（网页显示「服务器丢失」）。有显卡时改走 _load_breeze_streaming：
+        # 逐个张量读文件直接送显卡，提交额度一点点涨，页面文件跟得上。显存分配本身也占提交额度，
+        # 所以加载完进程大约 10 GB，这部分省不掉。纯 CPU 仍走官方加载、按全量检查。
         try:
             import torch
             _gpu = torch.cuda.is_available()
@@ -403,9 +508,24 @@ class BreezeEngine(Engine):
         from breeze_infer.runtime import load_runtime, resolve_device, update_generation_config_for_breeze
         from models.fast_streaming import FastBreezeStreamingRuntime, FastStreamingConfig
         print("loading Breeze ...", flush=True)
-        tok, model, atok = load_runtime(model_path("breeze-tts-2"), device=resolve_device(),
-                                        attn_implementation="eager")
+        try:
+            dev = resolve_device()
+            if dev.startswith("cuda"):
+                tok, model, atok = _load_breeze_streaming(Path(model_path("breeze-tts-2")), dev)
+            else:
+                tok, model, atok = load_runtime(model_path("breeze-tts-2"), device=dev,
+                                                attn_implementation="eager")
+        except Exception as e:
+            if "out of memory" not in str(e).lower():
+                raise
+            _free_gpu()
+            v = _vram_gb()
+            raise RuntimeError(
+                "显存不够，Breeze TTS 2 没装下"
+                + (f"（加载前空闲 {v[0]:.1f} GB，共 {v[1]:.1f} GB）" if v else "")
+                + "。把剪映/浏览器等占显卡的软件关掉再试。") from e
         update_generation_config_for_breeze(model)
+        _embed_to_cpu(model)
 
         def new_rt():
             return FastBreezeStreamingRuntime(
@@ -450,6 +570,13 @@ class BreezeEngine(Engine):
             raise gr.Error("Breeze 音色需要参考音频（克隆）或一句音色描述")
         _use_gpu(self)
         self.load()
+        # 11-13 实测：模型装好后生成一句，进程提交内存还要再涨约 3 GB（10 → 12.9 GB）。
+        # 额度不够时 Windows 直接杀进程（网页「Connection lost」），所以生成前先看一眼，宁可报错别崩。
+        _avail, _cap = _commit_gb()
+        if _avail < 3.5:
+            raise RuntimeError(
+                f"虚拟内存快用完了（提交额度只剩 {_avail:.1f} GB / 上限 {_cap:.1f} GB），这句生成到一半会被 Windows 强制结束。\n"
+                "先关掉 Chrome 多余标签页、微信、QQ、WPS 再点；一劳永逸：运行软件文件夹里的「设置虚拟内存.bat」并重启电脑。")
         m = self.m
         rid = f"ui-{uuid.uuid4().hex}"
         request["id"] = rid
@@ -718,22 +845,32 @@ def synth(text: str, voice: dict, tone: str = "", cfg: float = 2.0, seed: int = 
     return to_out_sr(audio, sr)
 
 
-def preload():
-    """设置里开了「启动时预加载」就在后台先把那个本地模型加载好，第一次生成不用等。默认不开，免得只用 API 的人白占显卡。"""
-    if settings_load().get("preload") != "breeze":
+def preload(voice: dict | None = None):
+    """设置里开了「启动时预加载」就在后台先把本地模型加载好：开软件时内存最空，第一次生成也不用等。
+    默认不开，免得只用 API 的人白占显卡。
+    "auto"（现在的开关）= 跟上次项目的音色走：Breeze 音色预载 Breeze，Qwen3 音色预载对应的 Qwen3 模型，
+    API 音色什么都不载；没有上次项目时按 Breeze。旧设置里的 "breeze" 当成 auto。"""
+    if settings_load().get("preload") not in ("auto", "breeze"):
         return
+    eng = engine_of(voice) if voice else ENGINES["breeze"]
+    if eng.kind != "local" or not eng.ready()[0]:
+        return
+    mid = None
+    if eng.id == "qwen3":
+        vkind = voice.get("kind") or ("clone" if voice.get("ref_audio") else "speaker")
+        mid = eng.pick_model(vkind, voice.get("model"))
+        if not mid:
+            return
 
     def run():
-        eng = ENGINES["breeze"]
-        if not eng.ready()[0]:
-            return
         with _gpu_lock:
             if _loaded["engine"] is None:
                 _use_gpu(eng)
                 try:
-                    eng.load()
+                    eng.load(mid) if mid else eng.load()
                 except Exception as e:
-                    print("预加载 Breeze 失败：", e, flush=True)
+                    print(f"预加载 {eng.name} 失败：", e, flush=True)
+                    eng.unload()
                     _loaded["engine"] = None
     threading.Thread(target=run, daemon=True).start()
 
